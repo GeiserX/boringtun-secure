@@ -29,7 +29,7 @@ flowchart TB
   subgraph sec["boringtun-secure"]
     L1["L1 ✅ mlock + zeroize-on-drop"]
     L2["L2 ✅ secure memory:<br/>memfd_secret + mprotect-guarded,<br/>raw only per-handshake"]
-    L3["L3 ⏳ sign-on-behalf:<br/>key-less datapath"]
+    L3["L3 ✅ sign-on-behalf:<br/>key-less datapath"]
     L1 -->|closes| v1
     L1 -->|closes| v2
     L2 -->|"closes (kernel/DMA/coredump),<br/>shrinks window"| v3
@@ -75,12 +75,24 @@ so the handshake math is byte-for-byte identical — **the upstream handshake te
 raw key is therefore in ordinary memory only for ~microseconds per rekey (~every two minutes), not the
 whole session.
 
-## L3 — sign-on-behalf (planned, strongest)
+## L3 — sign-on-behalf (done, strongest)
 
-Keep the key out of the datapath process entirely: a separate **signer process** holds it (in the same
-guarded secure memory) and performs the handshake's two static-key DH operations on request; the
-datapath holds only a socket handle. A compromise of the datapath then never yields the key. The
-`with_key()` accessor from L2 is the exact seam to route to the signer.
+Keep the key out of the datapath **process** entirely. The handshake's only static-key operation —
+`DH(static_private, peer_public)` — is performed through a `StaticKeyAgent` trait. The default agent
+holds the key in L2 guarded memory; for a key-less datapath, inject a different agent via
+`Tunn::new_with_agent`:
+
+- **`signer::serve_stream`** runs in a small **signer process** that holds the key (in the same L2
+  guarded memory, via `default_agent`) and answers `DH(static_private, peer_public)` over a unix socket,
+  authorizing the caller by `SO_PEERCRED` (`signer::peer_uid`).
+- **`signer::SignerClient`** is the datapath-side agent: it holds **only the socket and the (public)
+  static public key** — never the private key. A compromise of the datapath process therefore never
+  yields the key; it lives in a different process.
+
+A test (`a_handshake_completes_with_the_static_key_held_only_by_a_signer`) completes a real WireGuard
+handshake with the responder's key held only by the signer over a socket — the datapath `Tunn` never
+receives it. Wire protocol: the client writes 32 bytes (the peer public key), the signer replies with 32
+bytes (the DH output); the static public key is never sent (it is public).
 
 **Why a signer and not hardware:** WireGuard uses **Curve25519**, which mainstream secure hardware does
 **not** do — Apple's Secure Enclave is **P-256 only** (even on current hardware), and most TPMs lack
