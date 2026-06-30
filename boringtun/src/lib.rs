@@ -19,6 +19,9 @@ pub(crate) mod sleepyinstant;
 
 pub(crate) mod serialization;
 
+/// Secure storage for the static private key (boringtun-secure key-residency hardening).
+pub(crate) mod secure_mem;
+
 /// Re-export of the x25519 types
 pub mod x25519 {
     pub use x25519_dalek::{

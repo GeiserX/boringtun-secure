@@ -228,58 +228,43 @@ impl Tai64N {
     }
 }
 
-/// A WireGuard static private key held with **reduced residency** (boringtun-secure key-hardening).
-/// The key is pinned to a stable heap allocation that is:
+/// A WireGuard static private key held with **reduced residency** (boringtun-secure key-hardening, L2).
 ///
-/// * `mlock`'d, so it is never written to swap / disk (closes the swap-to-disk recovery vector), and
-/// * zeroized **and** unlocked on drop, so it never lingers in freed memory (`x25519_dalek::StaticSecret`
-///   derives `Zeroize` but does NOT zeroize on drop, so a bare value leaves the key in freed pages).
+/// The 32 scalar bytes live in [`crate::secure_mem::SecretStore`]: on Linux a `memfd_secret` page
+/// (invisible to the kernel, other processes, DMA, swap and coredumps; fail-closed to `mmap`+`mlock`
+/// when unavailable), elsewhere an `mlock`'d anonymous page — and in every case `mprotect(PROT_NONE)`
+/// at rest, made readable ONLY for the brief Diffie-Hellman during a handshake.
 ///
-/// It [`Deref`](std::ops::Deref)s to the inner [`x25519::StaticSecret`], so the handshake code that uses
-/// it (`diffie_hellman`, `PublicKey::from`) is unchanged. This hardens the one copy of the static key an
-/// embedding application cannot otherwise reach — the `Tunn`-internal copy. The remaining, deeper
-/// reductions (wrap-at-rest / sign-on-behalf so the raw key is resident only momentarily) are tracked in
-/// the fork's SECURITY-HARDENING.md.
+/// Access is via [`Self::with_key`] (deliberately **not** `Deref`): it opens the read window, hands the
+/// closure a transient [`x25519::StaticSecret`] reconstructed from the bytes, then zeroizes that
+/// transient and re-protects the page. So the raw key sits in ordinary memory only for ~microseconds
+/// per handshake. The `with_key` seam is also the exact hook a future sign-on-behalf signer (L3) wraps.
+/// See the fork's SECURITY-HARDENING.md.
 struct SecretGuard {
-    inner: Box<x25519::StaticSecret>,
+    store: crate::secure_mem::SecretStore,
 }
 
 impl SecretGuard {
-    fn new(secret: x25519::StaticSecret) -> Self {
-        // Box first, so the key has a stable address: locking/zeroizing must target the heap page, not a
-        // value that Rust may move when `SecretGuard` itself is moved.
-        let inner = Box::new(secret);
-        // Best-effort mlock — a failure (e.g. RLIMIT_MEMLOCK too low for an unprivileged process) must
-        // NOT break the datapath; the zeroize-on-drop guarantee below holds regardless.
-        #[cfg(unix)]
-        unsafe {
-            libc::mlock(
-                (&*inner as *const x25519::StaticSecret).cast::<libc::c_void>(),
-                core::mem::size_of::<x25519::StaticSecret>(),
-            );
-        }
-        SecretGuard { inner }
+    fn new(mut secret: x25519::StaticSecret) -> Self {
+        // Pull the scalar bytes out, move them into secure memory, and wipe both transient copies.
+        // The `to_bytes()`/`from()` round-trip is x25519-clamping-idempotent, so the reconstructed key
+        // computes byte-identical DH outputs — the upstream handshake suite is the proof of that.
+        let mut bytes = secret.to_bytes();
+        let store = crate::secure_mem::SecretStore::new(&bytes);
+        zeroize::Zeroize::zeroize(&mut bytes);
+        zeroize::Zeroize::zeroize(&mut secret);
+        SecretGuard { store }
     }
-}
 
-impl std::ops::Deref for SecretGuard {
-    type Target = x25519::StaticSecret;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl Drop for SecretGuard {
-    fn drop(&mut self) {
-        // Wipe the key bytes before the allocation is freed, then release the memory lock.
-        zeroize::Zeroize::zeroize(&mut *self.inner);
-        #[cfg(unix)]
-        unsafe {
-            libc::munlock(
-                (&*self.inner as *const x25519::StaticSecret).cast::<libc::c_void>(),
-                core::mem::size_of::<x25519::StaticSecret>(),
-            );
-        }
+    /// Run `f` with the static key, briefly reconstructed from secure memory and zeroized immediately
+    /// after. Used only at (re)key time (the static-key DHs), never per packet.
+    fn with_key<R>(&self, f: impl FnOnce(&x25519::StaticSecret) -> R) -> R {
+        self.store.with_bytes(|b| {
+            let mut sk = x25519::StaticSecret::from(*b);
+            let r = f(&sk);
+            zeroize::Zeroize::zeroize(&mut sk);
+            r
+        })
     }
 }
 
@@ -294,7 +279,7 @@ mod secret_guard_tests {
     use super::{x25519, SecretGuard};
 
     /// The guard must be a transparent stand-in for the bare key: same public key, same DH output —
-    /// so wrapping the static private key in `SecretGuard` cannot change a single handshake byte.
+    /// so moving the static private key into guarded memory cannot change a single handshake byte.
     #[test]
     fn guard_is_a_transparent_stand_in_for_the_bare_key() {
         let secret = x25519::StaticSecret::random_from_rng(rand_core::OsRng);
@@ -304,9 +289,15 @@ mod secret_guard_tests {
         let bare_dh = secret.diffie_hellman(&peer).to_bytes();
 
         let guard = SecretGuard::new(secret);
-        // Deref makes `diffie_hellman` / `PublicKey::from` resolve to the inner key unchanged.
-        assert_eq!(bare_public, x25519::PublicKey::from(&*guard).to_bytes());
-        assert_eq!(bare_dh, guard.diffie_hellman(&peer).to_bytes());
+        // Through with_key (no Deref): identical public key and identical DH output.
+        assert_eq!(
+            bare_public,
+            guard.with_key(|sk| x25519::PublicKey::from(sk)).to_bytes()
+        );
+        assert_eq!(
+            bare_dh,
+            guard.with_key(|sk| sk.diffie_hellman(&peer)).to_bytes()
+        );
     }
 }
 
@@ -485,7 +476,10 @@ impl NoiseParams {
         self.static_private = SecretGuard::new(static_private);
         self.static_public = static_public;
 
-        self.static_shared = self.static_private.diffie_hellman(&self.peer_static_public);
+        let peer_static = self.peer_static_public;
+        self.static_shared = self
+            .static_private
+            .with_key(|sk| sk.diffie_hellman(&peer_static));
     }
 }
 
@@ -586,7 +580,7 @@ impl Handshake {
         let ephemeral_shared = self
             .params
             .static_private
-            .diffie_hellman(&peer_ephemeral_public);
+            .with_key(|sk| sk.diffie_hellman(&peer_ephemeral_public));
         let temp = b2s_hmac(&chaining_key, &ephemeral_shared.to_bytes());
         // initiator.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
@@ -679,7 +673,7 @@ impl Handshake {
             &self
                 .params
                 .static_private
-                .diffie_hellman(&unencrypted_ephemeral)
+                .with_key(|sk| sk.diffie_hellman(&unencrypted_ephemeral))
                 .to_bytes(),
         );
         // responder.chaining_key = HMAC(temp, 0x1)
