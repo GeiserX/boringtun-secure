@@ -302,6 +302,14 @@ impl StaticKeyAgent for SecretGuard {
     }
 }
 
+/// The default [`StaticKeyAgent`]: holds the static private key locally in guarded secure memory (L2)
+/// and performs the DH itself. This is what [`crate::noise::Tunn::new`] uses, and what a signer process
+/// uses to hold its key. A key-less datapath instead injects a different agent (e.g. a client to a
+/// separate signer) via [`crate::noise::Tunn::new_with_agent`].
+pub fn default_agent(static_private: x25519::StaticSecret) -> Box<dyn StaticKeyAgent> {
+    Box::new(SecretGuard::new(static_private))
+}
+
 #[cfg(test)]
 mod secret_guard_tests {
     use super::{x25519, SecretGuard};

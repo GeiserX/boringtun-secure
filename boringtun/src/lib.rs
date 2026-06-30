@@ -22,6 +22,15 @@ pub(crate) mod serialization;
 /// Secure storage for the static private key (boringtun-secure key-residency hardening).
 pub(crate) mod secure_mem;
 
+/// Sign-on-behalf transport (L3): a signer process performs the static-key DH so the datapath process
+/// never holds the key. Unix-only (uses `AF_UNIX` sockets).
+#[cfg(unix)]
+pub mod signer;
+
+/// The static-key Diffie-Hellman seam (L3): inject a [`StaticKeyAgent`] via
+/// [`noise::Tunn::new_with_agent`] (or use [`default_agent`] to hold the key in guarded memory).
+pub use noise::handshake::{default_agent, StaticKeyAgent};
+
 /// Re-export of the x25519 types
 pub mod x25519 {
     pub use x25519_dalek::{
