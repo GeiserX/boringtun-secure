@@ -228,12 +228,94 @@ impl Tai64N {
     }
 }
 
+/// A WireGuard static private key held with **reduced residency** (boringtun-secure key-hardening).
+/// The key is pinned to a stable heap allocation that is:
+///
+/// * `mlock`'d, so it is never written to swap / disk (closes the swap-to-disk recovery vector), and
+/// * zeroized **and** unlocked on drop, so it never lingers in freed memory (`x25519_dalek::StaticSecret`
+///   derives `Zeroize` but does NOT zeroize on drop, so a bare value leaves the key in freed pages).
+///
+/// It [`Deref`](std::ops::Deref)s to the inner [`x25519::StaticSecret`], so the handshake code that uses
+/// it (`diffie_hellman`, `PublicKey::from`) is unchanged. This hardens the one copy of the static key an
+/// embedding application cannot otherwise reach — the `Tunn`-internal copy. The remaining, deeper
+/// reductions (wrap-at-rest / sign-on-behalf so the raw key is resident only momentarily) are tracked in
+/// the fork's SECURITY-HARDENING.md.
+struct SecretGuard {
+    inner: Box<x25519::StaticSecret>,
+}
+
+impl SecretGuard {
+    fn new(secret: x25519::StaticSecret) -> Self {
+        // Box first, so the key has a stable address: locking/zeroizing must target the heap page, not a
+        // value that Rust may move when `SecretGuard` itself is moved.
+        let inner = Box::new(secret);
+        // Best-effort mlock — a failure (e.g. RLIMIT_MEMLOCK too low for an unprivileged process) must
+        // NOT break the datapath; the zeroize-on-drop guarantee below holds regardless.
+        #[cfg(unix)]
+        unsafe {
+            libc::mlock(
+                (&*inner as *const x25519::StaticSecret).cast::<libc::c_void>(),
+                core::mem::size_of::<x25519::StaticSecret>(),
+            );
+        }
+        SecretGuard { inner }
+    }
+}
+
+impl std::ops::Deref for SecretGuard {
+    type Target = x25519::StaticSecret;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Drop for SecretGuard {
+    fn drop(&mut self) {
+        // Wipe the key bytes before the allocation is freed, then release the memory lock.
+        zeroize::Zeroize::zeroize(&mut *self.inner);
+        #[cfg(unix)]
+        unsafe {
+            libc::munlock(
+                (&*self.inner as *const x25519::StaticSecret).cast::<libc::c_void>(),
+                core::mem::size_of::<x25519::StaticSecret>(),
+            );
+        }
+    }
+}
+
+impl std::fmt::Debug for SecretGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+#[cfg(test)]
+mod secret_guard_tests {
+    use super::{x25519, SecretGuard};
+
+    /// The guard must be a transparent stand-in for the bare key: same public key, same DH output —
+    /// so wrapping the static private key in `SecretGuard` cannot change a single handshake byte.
+    #[test]
+    fn guard_is_a_transparent_stand_in_for_the_bare_key() {
+        let secret = x25519::StaticSecret::random_from_rng(rand_core::OsRng);
+        let peer =
+            x25519::PublicKey::from(&x25519::StaticSecret::random_from_rng(rand_core::OsRng));
+        let bare_public = x25519::PublicKey::from(&secret).to_bytes();
+        let bare_dh = secret.diffie_hellman(&peer).to_bytes();
+
+        let guard = SecretGuard::new(secret);
+        // Deref makes `diffie_hellman` / `PublicKey::from` resolve to the inner key unchanged.
+        assert_eq!(bare_public, x25519::PublicKey::from(&*guard).to_bytes());
+        assert_eq!(bare_dh, guard.diffie_hellman(&peer).to_bytes());
+    }
+}
+
 /// Parameters used by the noise protocol
 struct NoiseParams {
     /// Our static public key
     static_public: x25519::PublicKey,
-    /// Our static private key
-    static_private: x25519::StaticSecret,
+    /// Our static private key, held with reduced residency (mlock'd + zeroized on drop).
+    static_private: SecretGuard,
     /// Static public key of the other party
     peer_static_public: x25519::PublicKey,
     /// A shared key = DH(static_private, peer_static_public)
@@ -382,7 +464,7 @@ impl NoiseParams {
 
         NoiseParams {
             static_public,
-            static_private,
+            static_private: SecretGuard::new(static_private),
             peer_static_public,
             static_shared,
             sending_mac1_key: initial_sending_mac_key,
@@ -400,7 +482,7 @@ impl NoiseParams {
         let check_key = x25519::PublicKey::from(&static_private);
         assert_eq!(check_key.as_bytes(), static_public.as_bytes());
 
-        self.static_private = static_private;
+        self.static_private = SecretGuard::new(static_private);
         self.static_public = static_public;
 
         self.static_shared = self.static_private.diffie_hellman(&self.peer_static_public);

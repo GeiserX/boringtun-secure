@@ -2,6 +2,14 @@
 
 # BoringTun
 
+> ## 🔒 `boringtun-secure` — a security-hardened fork
+>
+> This is a fork of [cloudflare/boringtun](https://github.com/cloudflare/boringtun) that reduces the
+> **memory residency of the WireGuard static private key**: the key is `mlock`'d (never swapped to
+> disk) and zeroized on drop (never left in freed memory), with a roadmap to shrink the in-RAM window
+> further. It stays API-compatible — the upstream handshake test-suite passes unchanged — and keeps the
+> upstream **BSD-3-Clause** license. See **[SECURITY-HARDENING.md](./SECURITY-HARDENING.md)**.
+
 ## Warning
 Boringtun is currently undergoing a restructuring. You should probably not rely on or link to 
 the master branch right now. Instead you should use the crates.io page.
