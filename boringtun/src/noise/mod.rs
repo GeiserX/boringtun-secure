@@ -9,7 +9,7 @@ mod session;
 mod timers;
 
 use crate::noise::errors::WireGuardError;
-use crate::noise::handshake::Handshake;
+use crate::noise::handshake::{Handshake, StaticKeyAgent};
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::timers::{TimerName, Timers};
 use crate::x25519;
@@ -204,6 +204,43 @@ impl Tunn {
         Tunn {
             handshake: Handshake::new(
                 static_private,
+                static_public,
+                peer_static_public,
+                index << 8,
+                preshared_key,
+            ),
+            sessions: Default::default(),
+            current: Default::default(),
+            tx_bytes: Default::default(),
+            rx_bytes: Default::default(),
+
+            packet_queue: VecDeque::new(),
+            timers: Timers::new(persistent_keepalive, rate_limiter.is_none()),
+
+            rate_limiter: rate_limiter.unwrap_or_else(|| {
+                Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
+            }),
+        }
+    }
+
+    /// Create a `Tunn` whose static-key Diffie-Hellman is performed by `static_key_agent`
+    /// (sign-on-behalf, L3) instead of a held key. The datapath process never receives the static
+    /// private key — the agent (for example a client to a separate signer process) computes
+    /// `DH(static_private, ·)` on request. [`Tunn::new`] is the special case where the agent holds the
+    /// key locally in guarded secure memory.
+    pub fn new_with_agent(
+        static_key_agent: Box<dyn StaticKeyAgent>,
+        peer_static_public: x25519::PublicKey,
+        preshared_key: Option<[u8; 32]>,
+        persistent_keepalive: Option<u16>,
+        index: u32,
+        rate_limiter: Option<Arc<RateLimiter>>,
+    ) -> Self {
+        let static_public = x25519::PublicKey::from(static_key_agent.public_key());
+
+        Tunn {
+            handshake: Handshake::new_with_agent(
+                static_key_agent,
                 static_public,
                 peer_static_public,
                 index << 8,
@@ -719,6 +756,56 @@ mod tests {
         let keepalive = parse_handshake_resp(&mut my_tun, &resp);
         let packet = Tunn::parse_incoming_packet(&keepalive).unwrap();
         assert!(matches!(packet, Packet::PacketData(_)));
+    }
+
+    #[test]
+    fn handshake_runs_through_an_injected_static_key_agent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // An agent that holds the key and COUNTS the static-key DHs the datapath asks of it — proof
+        // the handshake routes its static-key operation through the injected agent (the L3 seam), not
+        // a key held by the datapath. A real deployment's agent forwards this to a separate signer.
+        struct CountingAgent {
+            secret: x25519::StaticSecret,
+            calls: Arc<AtomicUsize>,
+        }
+        impl StaticKeyAgent for CountingAgent {
+            fn diffie_hellman(&self, peer_public: &[u8; 32]) -> [u8; 32] {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.secret
+                    .diffie_hellman(&x25519::PublicKey::from(*peer_public))
+                    .to_bytes()
+            }
+            fn public_key(&self) -> [u8; 32] {
+                x25519::PublicKey::from(&self.secret).to_bytes()
+            }
+        }
+
+        let initiator_secret = x25519::StaticSecret::random_from_rng(OsRng);
+        let initiator_public = x25519::PublicKey::from(&initiator_secret);
+        let responder_secret = x25519::StaticSecret::random_from_rng(OsRng);
+        let responder_public = x25519::PublicKey::from(&responder_secret);
+
+        // The responder's static key lives ONLY in the agent — new_with_agent never receives a key.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = Box::new(CountingAgent {
+            secret: responder_secret,
+            calls: calls.clone(),
+        });
+        let mut responder = Tunn::new_with_agent(agent, initiator_public, None, None, 2, None);
+        let mut initiator = Tunn::new(initiator_secret, responder_public, None, None, 1, None);
+
+        let after_construction = calls.load(Ordering::SeqCst);
+        // Drive a real handshake; the responder performs DH(static, initiator_ephemeral) via the agent.
+        let init = create_handshake_init(&mut initiator);
+        let resp = create_handshake_response(&mut responder, &init);
+        let _keepalive = parse_handshake_resp(&mut initiator, &resp);
+
+        assert!(
+            calls.load(Ordering::SeqCst) > after_construction,
+            "the injected agent must perform the responder's static-key DH during the handshake"
+        );
     }
 
     #[test]

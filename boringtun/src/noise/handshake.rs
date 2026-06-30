@@ -478,15 +478,27 @@ impl NoiseParams {
         peer_static_public: x25519::PublicKey,
         preshared_key: Option<[u8; 32]>,
     ) -> NoiseParams {
-        let static_shared = static_private
-            .diffie_hellman(&peer_static_public)
-            .to_bytes();
+        Self::new_with_agent(
+            Box::new(SecretGuard::new(static_private)),
+            static_public,
+            peer_static_public,
+            preshared_key,
+        )
+    }
 
+    /// New noise params from a static-key AGENT (sign-on-behalf, L3) instead of a raw key. The agent
+    /// performs `DH(static_private, peer_static_public)`; this struct never sees the key material.
+    fn new_with_agent(
+        static_private: Box<dyn StaticKeyAgent>,
+        static_public: x25519::PublicKey,
+        peer_static_public: x25519::PublicKey,
+        preshared_key: Option<[u8; 32]>,
+    ) -> NoiseParams {
+        let static_shared = static_private.diffie_hellman(peer_static_public.as_bytes());
         let initial_sending_mac_key = b2s_hash(LABEL_MAC1, peer_static_public.as_bytes());
-
         NoiseParams {
             static_public,
-            static_private: Box::new(SecretGuard::new(static_private)),
+            static_private,
             peer_static_public,
             static_shared,
             sending_mac1_key: initial_sending_mac_key,
@@ -521,7 +533,24 @@ impl Handshake {
         global_idx: u32,
         preshared_key: Option<[u8; 32]>,
     ) -> Handshake {
-        let params = NoiseParams::new(
+        Self::new_with_agent(
+            Box::new(SecretGuard::new(static_private)),
+            static_public,
+            peer_static_public,
+            global_idx,
+            preshared_key,
+        )
+    }
+
+    /// Build a handshake driven by a static-key AGENT (sign-on-behalf, L3) rather than a held key.
+    pub(crate) fn new_with_agent(
+        static_private: Box<dyn StaticKeyAgent>,
+        static_public: x25519::PublicKey,
+        peer_static_public: x25519::PublicKey,
+        global_idx: u32,
+        preshared_key: Option<[u8; 32]>,
+    ) -> Handshake {
+        let params = NoiseParams::new_with_agent(
             static_private,
             static_public,
             peer_static_public,
