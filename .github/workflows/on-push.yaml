@@ -2,9 +2,9 @@ name: PR Status Checks
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "main", "master" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "main", "master" ]
 
 jobs:
   # Depends on all actions that are required for a "successful" CI run.
