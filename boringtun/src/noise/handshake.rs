@@ -274,6 +274,34 @@ impl std::fmt::Debug for SecretGuard {
     }
 }
 
+/// Performs the WireGuard handshake's static-key Diffie-Hellman WITHOUT exposing the static private key.
+///
+/// The static key does exactly one thing in the handshake — `DH(static_private, peer_public)` — at two
+/// points (the `DH(s, rs)` precompute and the per-handshake `DH(s, re)`). This trait abstracts that one
+/// operation so the key can live behind it. The DEFAULT implementation ([`SecretGuard`]) holds the key in
+/// guarded secure memory and does the DH locally (L2). An embedder may instead supply a SIGNER-backed
+/// agent (L3, sign-on-behalf): a separate process holds the key and returns the DH outputs over IPC, so
+/// the datapath process never holds the raw key. Only the 32 shared-secret bytes (which the handshake
+/// consumes as bytes for HMAC) cross the boundary — never a key-typed value.
+pub trait StaticKeyAgent: Send + Sync {
+    /// `DH(static_private, peer_public)` → the 32 shared-secret bytes.
+    fn diffie_hellman(&self, peer_public: &[u8; 32]) -> [u8; 32];
+    /// The static PUBLIC key bytes (derived from the private key).
+    fn public_key(&self) -> [u8; 32];
+}
+
+impl StaticKeyAgent for SecretGuard {
+    fn diffie_hellman(&self, peer_public: &[u8; 32]) -> [u8; 32] {
+        self.with_key(|sk| {
+            sk.diffie_hellman(&x25519::PublicKey::from(*peer_public))
+                .to_bytes()
+        })
+    }
+    fn public_key(&self) -> [u8; 32] {
+        self.with_key(|sk| x25519::PublicKey::from(sk).to_bytes())
+    }
+}
+
 #[cfg(test)]
 mod secret_guard_tests {
     use super::{x25519, SecretGuard};
@@ -305,12 +333,13 @@ mod secret_guard_tests {
 struct NoiseParams {
     /// Our static public key
     static_public: x25519::PublicKey,
-    /// Our static private key, held with reduced residency (mlock'd + zeroized on drop).
-    static_private: SecretGuard,
+    /// The static-key Diffie-Hellman agent (default: the guarded-memory key; or a signer for L3). The
+    /// raw static private key is never named here — only this agent performs `DH(static_private, ·)`.
+    static_private: Box<dyn StaticKeyAgent>,
     /// Static public key of the other party
     peer_static_public: x25519::PublicKey,
-    /// A shared key = DH(static_private, peer_static_public)
-    static_shared: x25519::SharedSecret,
+    /// A shared key = DH(static_private, peer_static_public), as raw bytes (the handshake HMACs it).
+    static_shared: [u8; KEY_LEN],
     /// A pre-computation of HASH("mac1----", peer_static_public) for this peer
     sending_mac1_key: [u8; KEY_LEN],
     /// An optional preshared key
@@ -449,13 +478,15 @@ impl NoiseParams {
         peer_static_public: x25519::PublicKey,
         preshared_key: Option<[u8; 32]>,
     ) -> NoiseParams {
-        let static_shared = static_private.diffie_hellman(&peer_static_public);
+        let static_shared = static_private
+            .diffie_hellman(&peer_static_public)
+            .to_bytes();
 
         let initial_sending_mac_key = b2s_hash(LABEL_MAC1, peer_static_public.as_bytes());
 
         NoiseParams {
             static_public,
-            static_private: SecretGuard::new(static_private),
+            static_private: Box::new(SecretGuard::new(static_private)),
             peer_static_public,
             static_shared,
             sending_mac1_key: initial_sending_mac_key,
@@ -473,13 +504,12 @@ impl NoiseParams {
         let check_key = x25519::PublicKey::from(&static_private);
         assert_eq!(check_key.as_bytes(), static_public.as_bytes());
 
-        self.static_private = SecretGuard::new(static_private);
+        self.static_private = Box::new(SecretGuard::new(static_private));
         self.static_public = static_public;
 
-        let peer_static = self.peer_static_public;
         self.static_shared = self
             .static_private
-            .with_key(|sk| sk.diffie_hellman(&peer_static));
+            .diffie_hellman(self.peer_static_public.as_bytes());
     }
 }
 
@@ -580,8 +610,8 @@ impl Handshake {
         let ephemeral_shared = self
             .params
             .static_private
-            .with_key(|sk| sk.diffie_hellman(&peer_ephemeral_public));
-        let temp = b2s_hmac(&chaining_key, &ephemeral_shared.to_bytes());
+            .diffie_hellman(peer_ephemeral_public.as_bytes());
+        let temp = b2s_hmac(&chaining_key, &ephemeral_shared);
         // initiator.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // key = HMAC(temp, initiator.chaining_key || 0x2)
@@ -606,7 +636,7 @@ impl Handshake {
         // initiator.hash = HASH(initiator.hash || msg.encrypted_static)
         hash = b2s_hash(&hash, packet.encrypted_static);
         // temp = HMAC(initiator.chaining_key, DH(initiator.static_private, responder.static_public))
-        let temp = b2s_hmac(&chaining_key, self.params.static_shared.as_bytes());
+        let temp = b2s_hmac(&chaining_key, &self.params.static_shared);
         // initiator.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // key = HMAC(temp, initiator.chaining_key || 0x2)
@@ -673,8 +703,7 @@ impl Handshake {
             &self
                 .params
                 .static_private
-                .with_key(|sk| sk.diffie_hellman(&unencrypted_ephemeral))
-                .to_bytes(),
+                .diffie_hellman(unencrypted_ephemeral.as_bytes()),
         );
         // responder.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
@@ -836,7 +865,7 @@ impl Handshake {
         // initiator.hash = HASH(initiator.hash || msg.encrypted_static)
         hash = b2s_hash(&hash, encrypted_static);
         // temp = HMAC(initiator.chaining_key, DH(initiator.static_private, responder.static_public))
-        let temp = b2s_hmac(&chaining_key, self.params.static_shared.as_bytes());
+        let temp = b2s_hmac(&chaining_key, &self.params.static_shared);
         // initiator.chaining_key = HMAC(temp, 0x1)
         chaining_key = b2s_hmac(&temp, &[0x01]);
         // key = HMAC(temp, initiator.chaining_key || 0x2)
